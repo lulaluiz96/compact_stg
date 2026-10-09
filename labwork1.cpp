@@ -7,13 +7,20 @@
 #include "my_interaction_functions.h"
 
 extern "C" {
+    #include <FreeRTOS.h>
+    #include <task.h>
+    #include <timers.h>
+    #include <semphr.h>
+    #include <interrupts.h>
     #include <interface.h>
 }
 
-void printMenu();
+#define mainREGION_1_SIZE 8201
+#define mainREGION_2_SIZE 29905
+#define mainREGION_3_SIZE 7607
 
-int main(int argc, char** argv) {
 
+static void menu(void* pvParameters) {
     // INPUT PORTS
     createDigitalInput(0);
     createDigitalInput(1);
@@ -22,7 +29,28 @@ int main(int argc, char** argv) {
     createDigitalOutput(2);
 
 
-    printMenu();
+    //printf("\n\tcallibrate kit manually and press enter...\n\n");
+
+    printf("\n\tauto-callibration in process...\n");
+    autoCallibrate();
+    printf("\tsystem callibrated. Cage at X = 1; Y = 2; Z = 1\n");
+
+    printf("\tCOMMANDS:\n\n");
+    printf("\t\twasd -> move on the X and Z axis\n");
+    printf("\t\tb (break) -> stop movement on all axis\n");
+    printf("\t\tp (position) -> print the current XYZ positions\n");
+    printf("\t\ti -> move Y inside\n");
+    printf("\t\to -> move Y outside\n\n");
+    printf("\t\t[1, 2, 3] -> [gotoX(1), gotoX(2), gotoX(3)]\n");
+    printf("\t\t[4, 5, 6] -> [gotoZ(1), gotoZ(2), gotoZ(3)]\n");
+    printf("\t\t[7, 8, 9] -> [gotoY(1), gotoY(2), gotoY(3)]\n\n");
+
+    printf("\t\tk -> put part in cell\n");
+    printf("\t\tl -> take part from cell\n");
+    printf("\t\tz -> move z to up position of corresponding z down position\n");
+    printf("\t\tx -> move z to down position of corresponding z up position\n\n");
+
+    printf("\t\tc -> enters the take/place items menu\n\n");
 
     int tecla = 0;
     while (tecla != 27) {
@@ -172,36 +200,167 @@ int main(int argc, char** argv) {
         }
     }
     closeChannels();
-
-    return 0;
-
 }
 
 
-void printMenu() {
-    //printf("\n\tcallibrate kit manually and press enter...\n\n");
-
-    printf("\n\tauto-callibration in process...\n");
-    autoCallibrate();
-    printf("\tsystem callibrated. Cage at X = 1; Y = 2; Z = 1\n");
-
-    printf("\tCOMMANDS:\n\n");
-    printf("\t\twasd -> move on the X and Z axis\n");
-    printf("\t\tb (break) -> stop movement on all axis\n");
-    printf("\t\tp (position) -> print the current XYZ positions\n");
-    printf("\t\ti -> move Y inside\n");
-    printf("\t\to -> move Y outside\n\n");
-    printf("\t\t[1, 2, 3] -> [gotoX(1), gotoX(2), gotoX(3)]\n");
-    printf("\t\t[4, 5, 6] -> [gotoZ(1), gotoZ(2), gotoZ(3)]\n");
-    printf("\t\t[7, 8, 9] -> [gotoY(1), gotoY(2), gotoY(3)]\n\n");
-
-    printf("\t\tk -> put part in cell\n");
-    printf("\t\tl -> take part from cell\n");
-    printf("\t\tz -> move z to up position of corresponding z down position\n");
-    printf("\t\tx -> move z to down position of corresponding z up position\n\n");
-
-    printf("\t\tc -> enters the take/place items menu\n\n");
+static void initialiseHeap(void)
+{
+    static uint8_t ucHeap[configTOTAL_HEAP_SIZE];
+    /* Just to prevent 'condition is always true' warnings in
+    configASSERT(). */
+    volatile uint32_t ulAdditionalOffset = 19;
+    const HeapRegion_t xHeapRegions[] =
+    {
+        /* Start address with dummy offsetsSize */
+        { ucHeap + 1,mainREGION_1_SIZE },
+        { ucHeap + 15 + mainREGION_1_SIZE,mainREGION_2_SIZE },
+        { ucHeap + 19 + mainREGION_1_SIZE +
+        mainREGION_2_SIZE,mainREGION_3_SIZE },
+        { NULL, 0 }
+    };
+    configASSERT((ulAdditionalOffset +
+        mainREGION_1_SIZE +
+        mainREGION_2_SIZE +
+        mainREGION_3_SIZE) < configTOTAL_HEAP_SIZE);
+    /* Prevent compiler warnings when configASSERT() is not defined. */
+    (void)ulAdditionalOffset;
+    vPortDefineHeapRegions(xHeapRegions);
 }
+
+
+void vAssertCalled(unsigned long ulLine, const char* const pcFileName)
+{
+    static BaseType_t xPrinted = pdFALSE;
+    volatile uint32_t ulSetToNonZeroInDebuggerToContinue = 0;
+
+    /* Called if an assertion passed to configASSERT() fails. See
+    http://www.freertos.org/a00110.html#configASSERT for more information. */
+    /* Parameters are not used. */
+
+    (void)ulLine;
+    (void)pcFileName;
+
+    printf("ASSERT! Line %ld, file %s, GetLastError() %ld\r\n", ulLine, pcFileName,
+    GetLastError());
+    taskENTER_CRITICAL();
+    {
+        /* Cause debugger break point if being debugged. */
+        __debugbreak();
+        /* You can step out of this function to debug the assertion by using
+        the debugger to set ulSetToNonZeroInDebuggerToContinue to a non-zero
+        value. */
+        while (ulSetToNonZeroInDebuggerToContinue == 0)
+        {
+            __asm { NOP };
+            __asm { NOP };
+        }
+    }
+    taskEXIT_CRITICAL();
+}
+
+
+void vTaskCode_2(void* pvParameters)
+{
+    for (;;)
+    {
+        printf("\nHello from TASK_2..");
+        taskYIELD();
+    }
+}
+
+void vTaskCode_1(void* pvParameters)
+{
+    for (;;) {
+        printf("\nHello from TASK_1");
+        // Although the kernel is in preemptive mode,
+        // we should help switch to another
+        // task with e.g. vTaskDelay(0) or taskYIELD()
+        taskYIELD();
+    }
+}
+
+void myDaemonTaskStartupHook(void) {
+
+    // runs only once;
+    // used for code initialization
+    //xTaskCreate(vTaskCode_2, "Task2", 100, NULL, 0, NULL);
+    //xTaskCreate(vTaskCode_1, "Task1", 100, NULL, 0, NULL);
+
+    xTaskCreate(menu, "Menu", 100, NULL, 0, NULL);
+}
+
+
+void vTaskHorizontal(void* pvParameters)
+{
+    while (TRUE)
+    {
+        //go right
+        uInt8 aa = readDigitalU8(2);
+        writeDigitalU8(2, (aa & (0xff - 0x40)) |
+            0x80);
+        // wait till last sensor
+        while (readDigitalU8(0) & 0x01) {
+            taskYIELD();
+        }
+        // go left
+        aa = readDigitalU8(2);
+        vTaskDelay(10); // to simulate some latency
+        writeDigitalU8(2, (aa & (0xff - 0x80)) |
+            0x40);
+        // wait till last sensor
+        while ((readDigitalU8(0) & 0x04)) {
+            taskYIELD();
+        }
+    }
+}
+
+
+void inicializarPortos() {
+   
+    printf("\nwaiting for hardware simulator...");
+    printf("\nReminding: gotoXZ requires kit calibration first...");
+    createDigitalInput(0);
+    createDigitalInput(1);
+    createDigitalOutput(2);
+    writeDigitalU8(2, 0);
+    printf("\ngot access to simulator...");
+}
+
+
+void vTaskVertical(void* pvParameters)
+{
+    while (TRUE)
+    {
+        //go up
+        uInt8 aa = readDigitalU8(2);
+        writeDigitalU8(2, (aa & (0xff - 0x04)) | 0x08);
+
+        // wait till last sensor
+        while ((readDigitalU8(0) & 0x40)) {
+            vTaskDelay(1); 
+        }
+        // go left
+        aa = readDigitalU8(2);
+        vTaskDelay(10); // to simulate some latency
+        writeDigitalU8(2, (aa & (0xff - 0x08)) | 0x04);
+
+        // wait till last sensor
+        while ((readDigitalU8(1) & 0x08)) {
+            vTaskDelay(1); 
+        }
+    }
+}
+
+
+
+
+int main()
+{
+    initialiseHeap();
+    vApplicationDaemonTaskStartupHook = &myDaemonTaskStartupHook;
+    vTaskStartScheduler();
+}
+
 
 
 
@@ -217,10 +376,6 @@ void printMenu() {
 //   4. Use the Error List window to view errors
 //   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
 //   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
-
-
-
-
 
 
   ////////////////////////////////////////////////////////////////////////////////////////
