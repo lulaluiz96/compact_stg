@@ -1,0 +1,9 @@
+NOTAS: 
+
+
+
+1. Problema da posição desconhecida e sua implicação na eficiência da locomoção da gaiola
+
+2. Consoante a tarefa que estamos a executar, podemos ir diretamente à posição Z Up ao invés de ir à Z Down e depois fazer gotoZUp
+
+3.
