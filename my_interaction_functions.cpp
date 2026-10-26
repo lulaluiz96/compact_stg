@@ -1,31 +1,40 @@
-// MY INTERATION FUNCTIONS
+// MY INTERACTION FUNCTIONS (v2)
 
 #include "my_interaction_functions.h"
 #include <stdio.h>
 
+extern "C" {
+#include <FreeRTOS.h>
+#include <task.h>
+#include <timers.h>
+#include <semphr.h>
+#include <interrupts.h>
+#include <interface.h>
+}
+
+// Sleep between two sensor reads. This is what lets the other axis task, the lights task,
+// the menu... run while this loop waits for a sensor (real concurrency).
+static inline void pollDelay() { vTaskDelay(POLL_DELAY_TICKS); }
 
 
-
-  ////////////////////////////////////////////////////////////////////////////////////////
- //							  BIT MANIPULATIONS FUNCTIONS							   //
+////////////////////////////////////////////////////////////////////////////////////////
+//							  BIT MANIPULATIONS FUNCTIONS							   //
 ////////////////////////////////////////////////////////////////////////////////////////
 
-
 /*
-*	Given a byte value, returns the value of it's Nth bit. 
+*	Given a byte value, returns the (masked) value of its Nth bit: 0 if low, non-zero if high.
 */
 int getBitValue(uInt8 value, uInt8 bit_n) {
 	return (value & (1 << bit_n));
 }
 
- 
 /*
-*	Given a byte value, set the Nth bit to value (new_value_bit)
+*	Set the Nth bit of *variable to new_value_bit
 */
-void setBitValue(uInt8 *variable, int n_bit, int new_value_bit) {
+void setBitValue(uInt8* variable, int n_bit, int new_value_bit) {
 
 	uInt8 mask_on = (uInt8)(1 << n_bit);
-	uInt8 mask_off = ~mask_on;
+	uInt8 mask_off = (uInt8)~mask_on;
 
 	if (new_value_bit) {
 		*variable |= mask_on;
@@ -35,537 +44,348 @@ void setBitValue(uInt8 *variable, int n_bit, int new_value_bit) {
 	}
 }
 
+/*
+*	Atomic read-modify-write of two bits of port 2 (shared by X, Y, Z and the lights).
+*	The critical section is tiny: one read, two bit operations, one write.
+*/
+static void setPort2Bits(int bitA, int valA, int bitB, int valB) {
+
+	taskENTER_CRITICAL();
+
+	uInt8 p2 = readDigitalU8(2);
+	setBitValue(&p2, bitA, valA);
+	setBitValue(&p2, bitB, valB);
+	writeDigitalU8(2, p2);
+
+	taskEXIT_CRITICAL();
+}
+
+static uInt8 readPort(uInt32 port) {
+
+	taskENTER_CRITICAL();
+	uInt8 value = readDigitalU8(port);
+	taskEXIT_CRITICAL();
+
+	return value;
+}
 
 
-
-  ////////////////////////////////////////////////////////////////////////////////////////
- //								X AXIS RELATED FUNCTIONS							   //
+////////////////////////////////////////////////////////////////////////////////////////
+//					SWITCHES, BOX SENSOR, LIGHTS, MOTION BITS						   //
 ////////////////////////////////////////////////////////////////////////////////////////
 
+/*
+*	Reads the two switches on the left of the kit (ACTIVE HIGH): true = pressed.
+*/
+void readSwitches(bool* switch1, bool* switch2) {
+
+	uInt8 p1 = readPort(1);
+
+	*switch1 = getBitValue(p1, P1_BIT_SWITCH_1) != 0;
+	*switch2 = getBitValue(p1, P1_BIT_SWITCH_2) != 0;
+}
 
 /*
-* Set the bits equivalent to move the X axis to the LEFT to high and RIGHT to low
+*	true if there is a box in the cage (sensor ACTIVE LOW).
 */
-void moveXLeft() {
+bool isBoxInCage() {
 
-	uInt8 p2 = readDigitalU8(2);		// read Port 2
+	uInt8 p1 = readPort(1);
 
-	setBitValue(&p2, 6, 1);			// set bit 6 to high level
-	setBitValue(&p2, 7, 0);			// set bit 7 to low level
+	return getBitValue(p1, P1_BIT_BOX_IN_CAGE) != 0;
+}
 
-	writeDigitalU8(2, p2);			// update Port 2
-	
+/*
+*	Turns the two lights on the left on/off (actuators ACTIVE HIGH).
+*/
+void setLights(bool upper, bool lower) {
+	setPort2Bits(P2_BIT_LIGHT_UPPER, upper, P2_BIT_LIGHT_LOWER, lower);
+}
 
-	/*
-			Schematics
+/*
+*	Returns the current state of the axis output bits (port 2, bits 2..7).
+*/
+uInt8 saveMotionBits() {
+	return (uInt8)(readPort(2) & P2_MOTION_MASK);
+}
 
-		before:
+/*
+*	Writes back axis output bits previously returned by saveMotionBits(), keeping the lights untouched.
+*/
+void restoreMotionBits(uInt8 bits) {
 
-			P2 = XXXXXXXX
+	taskENTER_CRITICAL();
 
-		after:
+	uInt8 p2 = readDigitalU8(2);
+	p2 = (uInt8)((p2 & ~P2_MOTION_MASK) | (bits & P2_MOTION_MASK));
+	writeDigitalU8(2, p2);
 
-			P2 = 01XXXXXX
-	*/
+	taskEXIT_CRITICAL();
 }
 
 
+////////////////////////////////////////////////////////////////////////////////////////
+//							GENERIC AXIS MOVEMENT HELPERS							   //
+////////////////////////////////////////////////////////////////////////////////////////
+
+typedef int  (*PosFn)();
+typedef void (*ActFn)();
+
 /*
-* Set the bits equivalent to move the X axis to the RIGHT to high and LEFT to low
+*	Moves one axis to 'target' (sensor position). Direction is only written to the port when it
+*	changes, the loop sleeps between reads (pollDelay) and the motor is stopped the instant the
+*	target sensor is seen.
+*
+*	whenUnknown: action used if the axis starts BETWEEN sensors (-1).
 */
-void moveXRight() {
+static void gotoAxis(int target, PosFn getPos, ActFn forward, ActFn backward, ActFn stop, ActFn whenUnknown) {
 
-	uInt8 p2 = readDigitalU8(2);		// read Port 2
+	int dir = 0;			// +1 forward, -1 backward, 0 stopped
+	int cur = getPos();
 
-	setBitValue(&p2, 6, 0);			// set bit 6 to low level
-	setBitValue(&p2, 7, 1);			// set bit 7 to high level
+	if (cur == -1) {
+		whenUnknown();
+		dir = (whenUnknown == forward) ? +1 : -1;
+	}
 
-	writeDigitalU8(2, p2);			// update Port 2
+	while ((cur = getPos()) != target) {
 
-	/*
- 			Schematics
-	
-	before:
+		if (cur != -1) {
+			int want = (cur < target) ? +1 : -1;
 
-		P2 = XXXXXXXX
+			if (want != dir) {
+				dir = want;
+				if (want > 0) forward(); else backward();
+			}
+		}
 
-	after:
+		pollDelay();
+	}
 
-		P2 = 10XXXXXX
-	*/
+	stop();
+}
+
+/*
+*	Moves one axis towards its home end until position 1 is seen.
+*/
+static void homeAxis(PosFn getPos, ActFn towardsHome, ActFn stop) {
+
+	if (getPos() != 1) {
+		towardsHome();
+
+		while (getPos() != 1) {
+			pollDelay();
+		}
+	}
+
+	stop();
 }
 
 
-/*
-*	Set the bits of LEFT and RIGHT to low
-*/
-void stopX() {
+////////////////////////////////////////////////////////////////////////////////////////
+//								X AXIS RELATED FUNCTIONS							   //
+////////////////////////////////////////////////////////////////////////////////////////
 
-	uInt8 p2 = readDigitalU8(2);		// read Port 2
-
-	setBitValue(&p2, 6, 0);			// set bit 6 to low level
-	setBitValue(&p2, 7, 0);			// set bit 7 to low level
-
-	writeDigitalU8(2, p2);			// update Port 2
-
-	/*
-			Schematics
-	
-	before:
-
-		P2 = XXXXXXXX
-
-	after:
-
-		P2 = 00XXXXXX
-	*/
-
-}
-
+void moveXLeft() { setPort2Bits(6, 1, 7, 0); }		// P2 = 01XXXXXX
+void moveXRight() { setPort2Bits(6, 0, 7, 1); }		// P2 = 10XXXXXX
+void stopX() { setPort2Bits(6, 0, 7, 0); }		// P2 = 00XXXXXX
 
 /*
-*	Get current X position. One of the four possible values: 1, 2, 3 or -1
+*	Current X position: 1, 2, 3 or -1 (between sensors)
 */
 int getXPos() {
 
-	uInt8 p0 = readDigitalU8(0);			// read Port 0
+	uInt8 p0 = readPort(0);
 
-	if (!getBitValue(p0, 2)) return 1;	// p0.2 = 0 (active low) -> X position = PosX_1
+	if (!getBitValue(p0, 2)) return 1;
+	if (!getBitValue(p0, 1)) return 2;
+	if (!getBitValue(p0, 0)) return 3;
 
-	if (!getBitValue(p0, 1)) return 2;	// p0.1 = 0 (active low) -> X position = PosX_2
-
-	if (!getBitValue(p0, 0)) return 3;	// p0.0 = 0 (active low) -> X position = PosX_3
-
-	return (-1);						// else X position is in between sensors
+	return (-1);
 }
 
-
-/*
-*	Move the CAGE on the X axis to the desired x position (1, 2 or 3)
-*/
 void gotoX(int x) {
+	gotoAxis(x, getXPos, moveXRight, moveXLeft, stopX, moveXRight);
+}
 
-	int currentXPos = getXPos();
-
-	if (currentXPos == -1) moveXRight();
-
-	do {
-		currentXPos = getXPos();
-		
-		if (currentXPos < x && currentXPos != -1) {
-			moveXRight();
-		}
-		else if (currentXPos > x) {
-			moveXLeft();
-		}
-
-	} while (currentXPos != x);
-	
-	stopX();
+void homeX() {
+	homeAxis(getXPos, moveXLeft, stopX);
 }
 
 
-
-
-  ////////////////////////////////////////////////////////////////////////////////////////
- //								Y AXIS RELATED FUNCTIONS							   //
+////////////////////////////////////////////////////////////////////////////////////////
+//								Y AXIS RELATED FUNCTIONS							   //
 ////////////////////////////////////////////////////////////////////////////////////////
 
+void moveYInside() { setPort2Bits(4, 0, 5, 1); }		// P2 = XX10XXXX
+void moveYOutside() { setPort2Bits(4, 1, 5, 0); }		// P2 = XX01XXXX
+void stopY() { setPort2Bits(4, 0, 5, 0); }		// P2 = XX00XXXX
 
 /*
-*	Set the bit for moving Y axis INSIDE to high and the bit for OUTSIDE to low
-*/
-void moveYInside() {
-
-	uInt8 p2 = readDigitalU8(2);		// read Port 2
-
-	setBitValue(&p2, 4, 0);			// set bit 4 to low level
-	setBitValue(&p2, 5, 1);			// set bit 5 to high level
-
-	writeDigitalU8(2, p2);			// update Port 2
-
-	/*
-			Schematics
-
-	before:
-
-		P2 = XXXXXXXX
-
-	after:
-
-		P2 = XX10XXXX
-	*/
-}
-
-
-/*
-*	Set the bit for moving Y axis OUTSIDE to hight and the bit for INSIDE to low
-*/
-void moveYOutside() {
-
-	uInt8 p2 = readDigitalU8(2);	// read Port 2
-
-	setBitValue(&p2, 5, 0);			// set bit 5 to low level
-	setBitValue(&p2, 4, 1);			// set bit 4 to high level
-
-	writeDigitalU8(2, p2);			// update Port 2
-
-	/*
-			Schematics
-
-	before:
-
-		P2 = XXXXXXXX
-
-	after:
-
-		P2 = XX01XXXX
-	*/
-}
-
-
-/*
-*	Set the bits for Y axis INSIDE and OUTSIDE both to low
-*/
-void stopY() {
-	
-	uInt8 p2 = readDigitalU8(2);	// read Port 2
-
-	setBitValue(&p2, 4, 0);			// set bit 2 to low level
-	setBitValue(&p2, 5, 0);			// set bit 3 to high level
-
-	writeDigitalU8(2, p2);			// update Port 2
-
-	/*
-			Schematics
-
-	before:
-
-		P2 = XXXXXXXX
-
-	after:
-
-		P2 = XX00XXXX
-	*/
-}
-
-
-/*
-*	Get current Y position. One of the four possible values: 1, 2, 3 or -1
+*	Current Y position: 1, 2, 3 or -1 (between sensors)
 */
 int getYPos() {
 
-	uInt8 p0 = readDigitalU8(0);			// read Port 0
+	uInt8 p0 = readPort(0);
 
-	if (!getBitValue(p0, 5)) return 1;	// p0.5 = 0 (active low) -> Y position = PosY_1
-	
-	if (!getBitValue(p0, 4)) return 2;	// p0.4 = 0 (active low) -> Y position = PosY_2
+	if (!getBitValue(p0, 5)) return 1;
+	if (!getBitValue(p0, 4)) return 2;
+	if (!getBitValue(p0, 3)) return 3;
 
-	if (!getBitValue(p0, 3)) return 3;	// p0.3 = 0 (active low) -> Y position = PosY_3
-
-	return (-1);						// else Y position is in between sensors
+	return (-1);
 }
 
-
-/*
-*	Move the CAGE on the Y axis to the desired x position (1, 2 or 3)
-*/
 void gotoY(int y) {
-
-	int currentYPos = getYPos();
-
-	if (currentYPos == -1) moveYInside();
-
-	do {
-		currentYPos = getYPos();
-
-		if (currentYPos < y && currentYPos != -1) {
-			moveYInside();
-		}
-		else if (currentYPos > y) {
-			moveYOutside();
-		}
-
-	} while (currentYPos != y);
-
-	stopY();
+	gotoAxis(y, getYPos, moveYInside, moveYOutside, stopY, moveYInside);
 }
 
 
-
-
-  ////////////////////////////////////////////////////////////////////////////////////////
- //								Z AXIS RELATED FUNCTIONS							   //
+////////////////////////////////////////////////////////////////////////////////////////
+//								Z AXIS RELATED FUNCTIONS							   //
 ////////////////////////////////////////////////////////////////////////////////////////
 
+void moveZUp() { setPort2Bits(2, 0, 3, 1); }			// P2 = XXXX10XX
+void moveZDown() { setPort2Bits(2, 1, 3, 0); }			// P2 = XXXX01XX
+void stopZ() { setPort2Bits(2, 0, 3, 0); }			// P2 = XXXX00XX
 
 /*
-*	Set the bit for moving Z axis UP to hight and the bit for DOWN to low
-*/
-void moveZUp() {
-
-	uInt8 p2 = readDigitalU8(2);	// read Port 2
-
-	setBitValue(&p2, 2, 0);			// set bit 2 to low level
-	setBitValue(&p2, 3, 1);			// set bit 3 to high level
-
-	writeDigitalU8(2, p2);			// update Port 2
-
-	/*
-			Schematics
-
-	before:
-
-		P2 = XXXXXXXX
-
-	after:
-
-		P2 = XXXX10XX
-	*/
-}
-
-
-/*
-*	 Set the bit for moving Z axis DOWN to hight and the bit for UP to low
-*/
-void moveZDown() {
-
-	uInt8 p2 = readDigitalU8(2);	// read Port 2
-
-	setBitValue(&p2, 2, 1);			// set bit 2 to high level
-	setBitValue(&p2, 3, 0);			// set bit 3 to low level
-
-	writeDigitalU8(2, p2);			// update Port 2
-
-	/*
-			Schematics
-
-	before:
-
-		P2 = XXXXXXXX
-
-	after:
-
-		P2 = XXXX01XX
-	*/
-}
-
-
-/*
-*	Set the bits for Z axis UP and DOWN both to low
-*/
-void stopZ() {
-
-	uInt8 p2 = readDigitalU8(2);	// read Port 2
-
-	setBitValue(&p2, 2, 0);			// set bit 2 to low level
-	setBitValue(&p2, 3, 0);			// set bit 3 to low level
-
-	writeDigitalU8(2, p2);			// update Port 2
-
-	/*
-			Schematics
-
-	before:
-
-		P2 = XXXXXXXX
-
-	after:
-
-		P2 = XXXX00XX
-	*/
-}
-
-
-/*
-*	Get current Z position. One of the four possible values: 1, 2, 3 or -1
+*	Current Z DOWN position: 1, 2, 3 or -1
 */
 int getZPos() {
 
-	uInt8 p0 = readDigitalU8(0);
-	uInt8 p1 = readDigitalU8(1);
+	uInt8 p0 = readPort(0);
+	uInt8 p1 = readPort(1);
 
-	if (!getBitValue(p1, 3)) return 1;	// p1.3 = 0 (active low) -> Z = 1 Down 
-
-	if (!getBitValue(p1, 1)) return 2;	// p1.1 = 0 (active low) -> Z = 2 Down
-
-	if (!getBitValue(p0, 7)) return 3;	// p0.7 = 0 (active low) -> Z = 3 Down
+	if (!getBitValue(p1, 3)) return 1;		// Z=1 Down
+	if (!getBitValue(p1, 1)) return 2;		// Z=2 Down
+	if (!getBitValue(p0, 7)) return 3;		// Z=3 Down
 
 	return (-1);
 }
 
-
 /*
-*	Move the CAGE on the Z axis to the desired Z Up position (1, 2, 3)
+*	Current Z UP position: 1, 2, 3 or -1
 */
 int getZUpPos() {
 
-	uInt8 p0 = readDigitalU8(0);
-	uInt8 p1 = readDigitalU8(1);
+	uInt8 p0 = readPort(0);
+	uInt8 p1 = readPort(1);
 
-	if (!getBitValue(p1, 2)) return 1;	// p1.2 = 0 (active low) -> Z = 1 Up 
-
-	if (!getBitValue(p1, 0)) return 2;	// p1.0 = 0 (active low) -> Z = 2 Up
-
-	if (!getBitValue(p0, 6)) return 3;	// p0.6 = 0 (active low) -> Z = 3 Up
+	if (!getBitValue(p1, 2)) return 1;		// Z=1 Up
+	if (!getBitValue(p1, 0)) return 2;		// Z=2 Up
+	if (!getBitValue(p0, 6)) return 3;		// Z=3 Up
 
 	return (-1);
 }
 
-
 /*
-*  Move the CAGE on the Y axis to the desired x position (1, 2 or 3)
+*	Goto the Z DOWN position z. If the cage starts between "Down" sensors (for example at an
+*	"Up" position) it goes DOWN first: that is always safe because a sensor exists at both
+*	ends, whereas going up from the top would run past the limit.
 */
 void gotoZ(int z) {
-
-	int currentZPos = getZPos();
-
-	if (currentZPos == -1) moveZUp();
-
-	do {
-		currentZPos = getZPos();
-
-		if (currentZPos < z && currentZPos != -1) {
-			moveZUp();
-		}
-		else if (currentZPos > z) {
-			moveZDown();
-		}
-
-	} while (currentZPos != z);
-
-	stopZ();
+	gotoAxis(z, getZPos, moveZUp, moveZDown, stopZ, moveZDown);
 }
-
-void gotoZUp(int z) {
-
-	int currentZPos = getZUpPos();
-
-	if (currentZPos == -1) moveZUp();
-
-	do {
-		currentZPos = getZUpPos();
-
-		if (currentZPos < z && currentZPos != -1) {
-			moveZUp();
-		}
-		else if (currentZPos > z) {
-			moveZDown();
-		}
-
-	} while (currentZPos != z);
-
-	stopZ();
-}
-
 
 /*
-*	Move Z axis in the UP direction until finding the corresponding Z UP position
+*	Goto the Z UP position z.
+*/
+void gotoZUp(int z) {
+	gotoAxis(z, getZUpPos, moveZUp, moveZDown, stopZ, moveZUp);
+}
+
+/*
+*	Move Z up until some Z UP sensor is found (no movement if already on one).
 */
 void movetoZUp() {
 
-	int currentZPos = getZUpPos();
-
-	do {
+	if (getZUpPos() == -1) {
 		moveZUp();
-		currentZPos = getZUpPos();
-	} while (currentZPos == -1);
+
+		while (getZUpPos() == -1) {
+			pollDelay();
+		}
+	}
 
 	stopZ();
 }
 
-
 /*
-*	Move the Z axis in the DOWN direction until finding the corresponding Z DOWN position
+*	Move Z down until some Z DOWN sensor is found (no movement if already on one).
 */
 void movetoZDown() {
 
-	int currentZPos = -1;
-	
-	do {
+	if (getZPos() == -1) {
 		moveZDown();
-		currentZPos = getZPos();
-	} while (currentZPos == -1);
+
+		while (getZPos() == -1) {
+			pollDelay();
+		}
+	}
 
 	stopZ();
 }
 
+void homeZ() {
+	homeAxis(getZPos, moveZDown, stopZ);
+}
 
 
-  ////////////////////////////////////////////////////////////////////////////////////////
- //								HIGHER FUNCTIONS									   //
+////////////////////////////////////////////////////////////////////////////////////////
+//			HIGHER FUNCTIONS (sequential versions, kept for manual tests)			   //
 ////////////////////////////////////////////////////////////////////////////////////////
 
-
-/*
-*	Givem that the CAGE is already in the desired position, executes the sequence of movements
-*	to place the part in the corresponding cell
-*/
 void putPartInCell() {
 
-	movetoZUp();		// go to corresponding z Up position
-	gotoY(3);		// move y to position 3
-	movetoZDown();	// go back to Z Down of that same Z position
-	gotoY(2);		// retract y back to the default 2 position
+	movetoZUp();
+	gotoY(3);
+	movetoZDown();
+	gotoY(2);
 }
 
-
-/*
-*	Givem that the CAGE is already in the desired position, executes the sequence of movements
-*	to place the part in the corresponding cell
-*/
 void takePartFromCell() {
 
-	gotoY(3);		// from the z down position go to y position 3
-	movetoZUp();		// elevate box by going to corresponding z up position
-	gotoY(2);		// bring the box into the cage by going to y position 2
-	movetoZDown();	// go back to default z down position
+	gotoY(3);
+	movetoZUp();
+	gotoY(2);
+	movetoZDown();
 }
 
-
-/*
-*	Moves CAGE to the desired cell and calls putPartInCell()
-*/
 void placeItemOnCell(int x, int z) {
-	gotoX(x);			// go to desired X position
-	gotoZUp(z);			// go to desired Z position
-	putPartInCell();	// place the item in the cell
-	autoCallibrate();	// calibrate the cage
+	gotoX(x);
+	gotoZUp(z);
+	putPartInCell();
+	autoCallibrate();
 }
 
-
-/*
-*	Moves CAGE to the desired cell and calls takePartFromCell()
-*/
 void takeItemFromCell(int x, int z) {
-	gotoX(x);				// go to desired X position
-	gotoZ(z);				// go to desired Z position
-	takePartFromCell();		// take the item from the cell
-	autoCallibrate();		// calibrate the cage
+	gotoX(x);
+	gotoZ(z);
+	takePartFromCell();
+	autoCallibrate();
 }
 
 
-
-
-  ////////////////////////////////////////////////////////////////////////////////////////
- //								UTILLITY FUNCTIONS									   //
+////////////////////////////////////////////////////////////////////////////////////////
+//								UTILITY FUNCTIONS									   //
 ////////////////////////////////////////////////////////////////////////////////////////
 
-
-/*
-*	Stops movement on all three axis.
-*/
 void stopAll() {
 	stopX();
 	stopY();
 	stopZ();
 }
 
-
 /*
-*	Positions the cage at X = 1 and Z = 1 at the start of the program
+*	Sequential calibration: Y to the centre first (X/Z may only move with Y == 2),
+*	then X -> 1 and Z -> 1.
 */
 void autoCallibrate() {
-	gotoX(1);
-	gotoZ(1);
+	gotoY(2);
+	homeX();
+	homeZ();
+}
+
+bool isHomed() {
+	return getXPos() == 1 && getYPos() == 2 && getZPos() == 1;
 }
